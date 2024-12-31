@@ -731,8 +731,12 @@ func TestUnmarshalHeaderError(t *testing.T) {
 		{"3df3726c0200", ErrBadHeader},
 		// Forbidden version 3 and obsolete "=srl" magic string
 		{"3d73726c0300", ErrBadHeader},
-		// Non-existing (yet) version 5, "=srl" with a high-bit-set-on-the-"s"
-		{"3df3726c0500", errors.New("document version '5' not yet supported")},
+		// Version 4, "=srl" with a high-bit-set-on-the-"s"
+		{"3df3726c0400", nil},
+		// Version 5, "=srl" with a high-bit-set-on-the-"s"
+		{"3df3726c0500", nil},
+		// Non-existing (yet) version 6, "=srl" with a high-bit-set-on-the-"s"
+		{"3df3726c0600", errors.New("document version '6' not yet supported")},
 	}
 
 	d := NewDecoder()
@@ -1234,5 +1238,27 @@ func testDecode(t *testing.T, noReferentialIntegrity bool, expected interface{},
 
 	if assert.NoError(t, err) {
 		assert.Equal(t, expected, decoded)
+	}
+}
+
+func TestCycle(t *testing.T) {
+	type Self struct {
+		Self *Self
+	}
+
+	t1 := new(Self)
+	t1.Self = t1
+	b, err := Marshal(t1)
+	if err != nil {
+		t.Fatalf("Cannot marshal a cycle to one self %s", err.Error())
+	}
+	t2 := new(Self)
+	err = Unmarshal(b, t2)
+	if err != nil {
+		t.Fatalf("Cannot unmarshal a cycle to one self %s", err.Error())
+	}
+
+	if t2 != t2.Self {
+		t.Fatalf("Cannot unmarshal a cycle to one self")
 	}
 }

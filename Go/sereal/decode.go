@@ -118,13 +118,7 @@ func checkHeader(b []byte) (serealHeader, error) {
 	}
 
 	switch header.version {
-	case 1:
-		break
-	case 2:
-		break
-	case 3:
-		break
-	case 4:
+	case 1, 2, 3, 4, 5:
 		break
 	default:
 		return header, fmt.Errorf("document version '%d' not yet supported", header.version)
@@ -313,6 +307,9 @@ func (d *Decoder) decode(by []byte, idx int, ptr *interface{}) (int, error) {
 	case tag == typeFLOAT:
 		*ptr, idx, err = d.decodeFloat(by, idx)
 
+	case tag == typeFLOAT128:
+		*ptr, idx, err = d.decodeFloat128(by, idx)
+
 	case tag == typeDOUBLE:
 		*ptr, idx, err = d.decodeDouble(by, idx)
 
@@ -321,6 +318,20 @@ func (d *Decoder) decode(by []byte, idx int, ptr *interface{}) (int, error) {
 
 	case tag == typeFALSE:
 		*ptr = false
+
+	case tag == typeYES:
+		if d.PerlCompat {
+			*ptr = &PerlYes{}
+		} else {
+			*ptr = true
+		}
+
+	case tag == typeNO:
+		if d.PerlCompat {
+			*ptr = &PerlNo{}
+		} else {
+			*ptr = false
+		}
 
 	case tag == typeHASH:
 		// see commends at top of the function
@@ -431,9 +442,15 @@ func (d *Decoder) decode(by []byte, idx int, ptr *interface{}) (int, error) {
 			idx, err = d.decode(by, idx, ptr)
 		}
 
-	case tag == typeREFP, tag == typeALIAS:
+	case tag == typeREFP:
 		var val reflect.Value
-		if val, idx, err = d.decodeREFP_ALIAS(by, idx, tag == typeREFP); err == nil {
+		if val, idx, err = d.decodeREFP(by, idx); err == nil {
+			*ptr = val.Interface()
+		}
+
+	case tag == typeALIAS:
+		var val reflect.Value
+		if val, idx, err = d.decodeALIAS(by, idx); err == nil {
 			*ptr = val.Interface()
 		}
 
@@ -489,6 +506,16 @@ func (d *Decoder) decodeFloat(by []byte, idx int) (float32, int, error) {
 
 	bits := uint32(by[idx]) | uint32(by[idx+1])<<8 | uint32(by[idx+2])<<16 | uint32(by[idx+3])<<24
 	return math.Float32frombits(bits), idx + 4, nil
+}
+
+func (d *Decoder) decodeFloat128(by []byte, idx int) (*Float128, int, error) {
+	if idx+15 >= len(by) {
+		return nil, 0, ErrTruncated
+	}
+
+	res := Float128{}
+	copy(res.Bytes[:], by[idx:idx+16])
+	return &res, idx + 16, nil
 }
 
 func (d *Decoder) decodeDouble(by []byte, idx int) (float64, int, error) {
@@ -758,8 +785,27 @@ func (d *Decoder) decodeViaReflection(by []byte, idx int, ptr reflect.Value) (in
 		}
 		ptr.SetFloat(val)
 
+	case tag == typeFLOAT128:
+		var val *Float128
+		if val, idx, err = d.decodeFloat128(by, idx); err != nil {
+			return 0, err
+		}
+
+		ptr.Set(reflect.ValueOf(val))
+
 	case tag == typeTRUE, tag == typeFALSE:
 		ptr.SetBool(tag == typeTRUE)
+
+	case tag == typeNO, tag == typeYES:
+		if d.PerlCompat {
+			if tag == typeYES {
+				ptr.Set(reflect.ValueOf(&PerlYes{}))
+			} else {
+				ptr.Set(reflect.ValueOf(&PerlNo{}))
+			}
+		} else {
+			ptr.SetBool(tag == typeYES)
+		}
 
 	case tag == typeBINARY:
 		var val []byte
@@ -849,9 +895,21 @@ func (d *Decoder) decodeViaReflection(by []byte, idx int, ptr reflect.Value) (in
 	case tag == typeREFN:
 		idx, err = d.decodeViaReflection(by, idx, ptr)
 
-	case tag == typeREFP, tag == typeALIAS:
+	case tag == typeREFP:
 		var val reflect.Value
-		if val, idx, err = d.decodeREFP_ALIAS(by, idx, tag == typeREFP); err != nil {
+		if val, idx, err = d.decodeREFP(by, idx); err != nil {
+			return 0, err
+
+		}
+		if ptr.Kind() == reflect.Ptr {
+			ptr.Set(val)
+		} else {
+			ptr.Set(val.Elem())
+		}
+
+	case tag == typeALIAS:
+		var val reflect.Value
+		if val, idx, err = d.decodeALIAS(by, idx); err != nil {
 			return 0, err
 
 		}
@@ -1017,7 +1075,7 @@ func (d *Decoder) decodeHashViaReflection(by []byte, idx int, ln int, ptr reflec
 	return idx, nil
 }
 
-func (d *Decoder) decodeREFP_ALIAS(by []byte, idx int, isREFP bool) (reflect.Value, int, error) {
+func (d *Decoder) decodeREFP(by []byte, idx int) (reflect.Value, int, error) {
 	offs, sz, err := varintdecode(by[idx:])
 	if err != nil {
 		var res reflect.Value
@@ -1034,11 +1092,7 @@ func (d *Decoder) decodeREFP_ALIAS(by []byte, idx int, isREFP bool) (reflect.Val
 	if !ok {
 		var res reflect.Value
 		var corrupt ErrCorrupt
-		if isREFP {
-			corrupt.Err = errUntrackedOffsetREFP
-		} else {
-			corrupt.Err = errUntrackedOffsetAlias
-		}
+		corrupt.Err = errUntrackedOffsetREFP
 		return res, 0, corrupt
 	}
 
@@ -1049,17 +1103,51 @@ func (d *Decoder) decodeREFP_ALIAS(by []byte, idx int, isREFP bool) (reflect.Val
 		// rv.Elem() will be an interface
 		// rv.Elem().Elem() should be the data inside interface
 
-		if isREFP {
-			rvData := rv.Elem().Elem()
-			if d.DisableReferentialIntegrity {
-				res = rvData
-			} else {
-				res = reflect.New(rvData.Type())
-				res.Elem().Set(rvData)
-			}
+		rvData := rv.Elem().Elem()
+		if d.DisableReferentialIntegrity {
+			res = rvData
 		} else {
-			res = rv.Elem()
+			res = reflect.New(rvData.Type())
+			res.Elem().Set(rvData)
 		}
+	} else {
+		// rv contains original value
+		// i.e. it was saved in decodeViaReflection() path
+		res = rv.Addr()
+	}
+
+	return res, idx, nil
+}
+
+func (d *Decoder) decodeALIAS(by []byte, idx int) (reflect.Value, int, error) {
+	offs, sz, err := varintdecode(by[idx:])
+	if err != nil {
+		var res reflect.Value
+		return res, 0, err
+	}
+	idx += sz
+
+	if offs < 0 || offs >= idx {
+		var res reflect.Value
+		return res, 0, ErrCorrupt{errBadOffset}
+	}
+
+	rv, ok := d.tracked[offs]
+	if !ok {
+		var res reflect.Value
+		var corrupt ErrCorrupt
+		corrupt.Err = errUntrackedOffsetAlias
+		return res, 0, corrupt
+	}
+
+	var res reflect.Value
+	if rv.Kind() == reflect.Ptr && rv.Elem().Kind() == reflect.Interface {
+		// rv contains *interface{},
+		// i.e. it was saved in decode() path
+		// rv.Elem() will be an interface
+		// rv.Elem().Elem() should be the data inside interface
+
+		res = rv.Elem()
 	} else {
 		// rv contains original value
 		// i.e. it was saved in decodeViaReflection() path
@@ -1185,7 +1273,6 @@ func (d *Decoder) decodeObjectFreezeViaReflection(by []byte, idx int, ptr reflec
 					if err := obj.UnmarshalBinary(classData); err != nil {
 						return 0, err
 					}
-
 					ptr.Set(reflect.ValueOf(obj))
 				} else {
 					ptr.Set(reflect.ValueOf(&PerlFreeze{strClassName, classData}))
